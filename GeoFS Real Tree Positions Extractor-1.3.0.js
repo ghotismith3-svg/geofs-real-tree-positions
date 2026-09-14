@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         GeoFS Real Tree Positions Extractor
 // @namespace    https://www.geo-fs.com/geofs.php?v=4
-// @version      1.3.0
-// @description  Extracts real tree positions (lat/lon/height) from geofs.trees .glb tiles, decoding Draco by hand. Exposes window.geofsRealTrees for other scripts to use. v1.3: adds spatial grid + ECEF position cache so isTreeNear() doesn't depend on the total number of loaded trees (avoids lag in dense forest).
+// @version      1.9.2
+// @description  Extracts real tree positions (lat/lon/height) from geofs.trees .glb tiles, decoding Draco by hand. Exposes window.geofsRealTrees for other scripts to use. v1.9.0 CYLINDER COLLISION FIX: replaced point-sphere distance check with a true 3D vertical cylinder. v1.9.1: Exit button in dashboard. v1.9.2: Clean console logging (silent tile loader by default) and scratch vector memory optimization.
+// @author       yasseristaken
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
@@ -23,16 +24,20 @@
     APEX_INDEX_IN_GROUP: 0, // first vertex of each group of 6, used as a position proxy
     RESCAN_INTERVAL_MS: 3000,
     MAX_TREES_KEPT: 200000,
-    // FIX v1.3.0: spatial grid cell size, in degrees. ~0.0005° is about
-    // 55m along the latitude axis (a bit less in longitude, depending on
-    // latitude, due to projection -- that doesn't break anything because
-    // the search radius in isTreeNear() is always recalculated in degrees
-    // based on the real latitude, so if the cell "shrinks" in meters near
-    // the poles, we simply scan more cells to cover the same real-world
-    // radius. Trees are never lost because of this, only the number of
-    // cells scanned changes.
-    GRID_CELL_DEG: 0.0005
+    GRID_CELL_DEG: 0.0005,
+    MAX_TREE_HEIGHT_ABOVE_TERRAIN_M: 60,
+    // FIX v1.9.0: Default vertical canopy height (meters) in GeoFS.
+    // Trees in GeoFS typically render up to ~30-35m above ground level.
+    DEFAULT_CANOPY_HEIGHT_M: 32,
+    // Vertical margin below the tree base to handle slope / gear penetration
+    BASE_VERTICAL_MARGIN_M: 3,
+    // Console output control: false keeps browser console quiet and clean during flight
+    DEBUG_LOGS: false
   };
+
+  // Scratch Cesium objects for zero-allocation geometry math in high-frequency checks
+  let _scratchTarget = null;
+  let _scratchUpNormal = null;
 
   // ============================================================
   // State
@@ -44,21 +49,12 @@
     treesByTile: new Map(),
     flatCache: null,
     flatCacheDirty: true,
-    // FIX v1.3.0: spatial grid for radius queries in O(nearby cells)
-    // instead of O(total loaded trees).
-    // Structure: Map<cellKey, Map<tileId, Float64Array of [x,y,z,x,y,z,...]>>
-    // Stored in ECEF (x,y,z), already converted, instead of lat/lon, so we
-    // don't have to redo Cesium.Cartesian3.fromDegrees (trigonometry) on
-    // every isTreeNear() check -- that conversion is done once here, when
-    // the tile is processed.
     grid: new Map(),
-    // Map<tileId, Set<cellKey>> -- so we can remove from the grid exactly
-    // the cells a given tile touched when that tile gets unloaded, without
-    // having to scan the whole grid looking for who belongs to whom.
     tileCellKeys: new Map()
   };
 
   function getCesium() { return window.Cesium || window.geofs?.api?.Cesium || null; }
+  function getViewer() { return window.geofs?.api?.viewer || null; }
 
   function cellKeyFor(lat, lon) {
     const gx = Math.floor(lat / CONFIG.GRID_CELL_DEG);
@@ -150,10 +146,11 @@
 
   // ============================================================
   // Process a full tile: download, decode, transform to lat/lon/height,
-  // and also index it into the spatial grid (v1.3.0)
+  // filter out corrupted vertices, and index into the spatial grid
   // ============================================================
   async function processTile(tileEntry, providerOptions) {
     const Cesium = getCesium();
+    const viewer = getViewer();
     if (!Cesium || tileEntry.__realTreesProcessing) return;
     if (state.processedTileIds.has(tileEntry.id)) return;
     tileEntry.__realTreesProcessing = true;
@@ -164,6 +161,25 @@
       const model = tileEntry.model._model;
       const modelMatrix = model?.modelMatrix;
       if (!modelMatrix) return;
+
+      const matrixSnapshot = Cesium.Matrix4.clone(modelMatrix);
+
+      let tileRect = null;
+      const scheme = window.geofs?.trees?.simple3DTileProvider?.tilingScheme;
+      if (scheme && typeof scheme.tileXYToRectangle === "function" && tileEntry.x != null && tileEntry.y != null && tileEntry.z != null) {
+        try {
+          const z = parseInt(tileEntry.z, 10);
+          // Row index mismatch fix (y+1)
+          let correctedY = tileEntry.y + 1;
+          if (typeof scheme.getNumberOfYTilesAtLevel === "function") {
+            const maxY = scheme.getNumberOfYTilesAtLevel(z) - 1;
+            if (correctedY > maxY) correctedY = maxY;
+          }
+          tileRect = scheme.tileXYToRectangle(tileEntry.x, correctedY, z);
+        } catch (e) {
+          tileRect = null;
+        }
+      }
 
       const url = providerOptions.url + tileEntry.id + (providerOptions.extension || ".glb");
       const res = await fetch(url);
@@ -176,7 +192,6 @@
       if (usesDraco) {
         positions = await decodeDracoPositions(json, binChunk);
       } else {
-        // Fallback in case some tile isn't Draco-compressed
         const prim = json.meshes[0].primitives[0];
         const accessor = json.accessors[prim.attributes.POSITION];
         const bufferView = json.bufferViews[accessor.bufferView];
@@ -186,62 +201,128 @@
 
       const vertCount = positions.length / 3;
       const numTrees = Math.floor(vertCount / CONFIG.VERTS_PER_TREE);
-      const out = new Float64Array(numTrees * 3);
 
       const localPoint = new Cesium.Cartesian3();
       const worldPoint = new Cesium.Cartesian3();
 
-      // FIX v1.3.0: here we accumulate this tile's trees grouped by grid
-      // cell, storing x/y/z (ECEF) directly instead of lat/lon, because
-      // we already have that worldPoint computed in this same loop --
-      // no point converting it to degrees just to store it and then
-      // convert it back to Cartesian on every isTreeNear() call.
+      const terrainHeightCache = new Map();
+      const tempCarto = viewer ? new Cesium.Cartographic() : null;
+
+      function terrainHeightForCell(lat, lon, key) {
+        if (terrainHeightCache.has(key)) return terrainHeightCache.get(key);
+        let h = null;
+        if (viewer) {
+          try {
+            tempCarto.latitude = Cesium.Math.toRadians(lat);
+            tempCarto.longitude = Cesium.Math.toRadians(lon);
+            h = viewer.scene.globe.getHeight(tempCarto);
+          } catch (e) {
+            h = null;
+          }
+        }
+        terrainHeightCache.set(key, h);
+        return h;
+      }
+
+      const out = new Float64Array(numTrees * 3);
       const byCell = new Map();
+      let kept = 0;
+      let droppedHeight = 0;
+      let droppedBounds = 0;
+
+      let minLat = Infinity, maxLat = -Infinity;
+      let minLon = Infinity, maxLon = -Infinity;
 
       for (let t = 0; t < numTrees; t++) {
         const vIdx = (t * CONFIG.VERTS_PER_TREE + CONFIG.APEX_INDEX_IN_GROUP) * 3;
 
-        // CRITICAL FIX (v1.1.0): the tree tiles are glTF, Y-up convention.
-        // The local Y axis is the one representing real height (small
-        // range, hundreds of meters); X and Z are the two horizontal axes
-        // of the tile plane (large range, tens of km -- confirmed by
-        // looking at accessors.min/max: X and Z ~38km range, Y ~600m).
-        // The previous version used the raw Z as height, giving results
-        // of up to -38000m. Cesium does this Y-up -> Z-up conversion
-        // automatically when rendering the whole model, but when
-        // multiplying a loose vertex by hand against modelMatrix we have
-        // to apply it ourselves: (x,y,z) -> (x,-z,y).
         const xLocal = positions[vIdx];
-        const yLocal = positions[vIdx + 1]; // real height
-        const zLocal = positions[vIdx + 2]; // horizontal
+        const yLocal = positions[vIdx + 1];
+        const zLocal = positions[vIdx + 2];
 
         localPoint.x = xLocal;
         localPoint.y = -zLocal;
         localPoint.z = yLocal;
 
-        Cesium.Matrix4.multiplyByPoint(modelMatrix, localPoint, worldPoint);
+        Cesium.Matrix4.multiplyByPoint(matrixSnapshot, localPoint, worldPoint);
         const carto = Cesium.Cartographic.fromCartesian(worldPoint);
+
+        let dropBounds = false;
+        if (tileRect) {
+          dropBounds =
+            carto.latitude < tileRect.south ||
+            carto.latitude > tileRect.north ||
+            carto.longitude < tileRect.west ||
+            carto.longitude > tileRect.east;
+          if (dropBounds) droppedBounds++;
+        }
 
         const lat = Cesium.Math.toDegrees(carto.latitude);
         const lon = Cesium.Math.toDegrees(carto.longitude);
-
-        out[t * 3] = lat;
-        out[t * 3 + 1] = lon;
-        out[t * 3 + 2] = carto.height;
-
         const key = cellKeyFor(lat, lon);
+
+        const terrainH = terrainHeightForCell(lat, lon, key);
+        let aboveTerrain = null;
+        let dropHeight = false;
+        if (terrainH != null) {
+          aboveTerrain = carto.height - terrainH;
+          dropHeight = aboveTerrain > CONFIG.MAX_TREE_HEIGHT_ABOVE_TERRAIN_M;
+          if (dropHeight) droppedHeight++;
+        }
+
+        if (t === 0 && CONFIG.DEBUG_LOGS) {
+          console.log(
+            `[RealTrees][DEBUG] Tile ${tileEntry.id} first tree -- ` +
+            `lat=${lat.toFixed(6)} lon=${lon.toFixed(6)} height=${carto.height.toFixed(2)}m | ` +
+            `tileRect(deg)=[south=${tileRect ? Cesium.Math.toDegrees(tileRect.south).toFixed(6) : "n/a"}, ` +
+            `north=${tileRect ? Cesium.Math.toDegrees(tileRect.north).toFixed(6) : "n/a"}, ` +
+            `west=${tileRect ? Cesium.Math.toDegrees(tileRect.west).toFixed(6) : "n/a"}, ` +
+            `east=${tileRect ? Cesium.Math.toDegrees(tileRect.east).toFixed(6) : "n/a"}] | ` +
+            `dropBounds=${dropBounds} | ` +
+            `terrainH=${terrainH != null ? terrainH.toFixed(2) + "m" : "n/a"} aboveTerrain=${aboveTerrain != null ? aboveTerrain.toFixed(2) + "m" : "n/a"} ` +
+            `dropHeight=${dropHeight}`
+          );
+        }
+
+        if (dropBounds || dropHeight) continue;
+
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+
+        out[kept * 3] = lat;
+        out[kept * 3 + 1] = lon;
+        out[kept * 3 + 2] = carto.height;
+        kept++;
+
         if (!byCell.has(key)) byCell.set(key, []);
-        // store the already-computed ECEF (worldPoint), not lat/lon
         byCell.get(key).push(worldPoint.x, worldPoint.y, worldPoint.z);
       }
 
-      state.treesByTile.set(tileEntry.id, out);
+      if (tileRect && kept > 0 && CONFIG.DEBUG_LOGS) {
+        const rectSouth = Cesium.Math.toDegrees(tileRect.south);
+        const rectNorth = Cesium.Math.toDegrees(tileRect.north);
+        const rectWest = Cesium.Math.toDegrees(tileRect.west);
+        const rectEast = Cesium.Math.toDegrees(tileRect.east);
+
+        const southOverflow = minLat < rectSouth ? (rectSouth - minLat) : 0;
+        const northOverflow = maxLat > rectNorth ? (maxLat - rectNorth) : 0;
+        const westOverflow = minLon < rectWest ? (rectWest - minLon) : 0;
+        const eastOverflow = maxLon > rectEast ? (maxLon - rectEast) : 0;
+
+        console.log(
+          `[RealTrees][DEBUG] Tile ${tileEntry.id} extent (${kept} surviving trees) -- ` +
+          `lat=[${minLat.toFixed(6)}, ${maxLat.toFixed(6)}] lon=[${minLon.toFixed(6)}, ${maxLon.toFixed(6)}] | ` +
+          `overflow(deg): S=${southOverflow.toFixed(6)} N=${northOverflow.toFixed(6)} W=${westOverflow.toFixed(6)} E=${eastOverflow.toFixed(6)}`
+        );
+      }
+
+      const trimmed = out.subarray(0, kept * 3);
+      state.treesByTile.set(tileEntry.id, trimmed);
       state.processedTileIds.add(tileEntry.id);
       state.flatCacheDirty = true;
 
-      // FIX v1.3.0: dump byCell into the global grid and remember which
-      // cells this tile touched, so we can undo exactly this when the
-      // tile gets unloaded (see scanTiles()).
       const usedCells = new Set();
       for (const [key, arr] of byCell) {
         if (!state.grid.has(key)) state.grid.set(key, new Map());
@@ -250,7 +331,19 @@
       }
       state.tileCellKeys.set(tileEntry.id, usedCells);
 
-      console.log(`[RealTrees] ✅ Tile ${tileEntry.id}: ${numTrees} trees extracted (${usedCells.size} grid cells)`);
+      const droppedTotal = droppedHeight + droppedBounds;
+      if (droppedTotal > 0 && CONFIG.DEBUG_LOGS) {
+        console.warn(
+          `[RealTrees] ⚠️ Tile ${tileEntry.id}: dropped ${droppedTotal} corrupted tree(s) ` +
+          `(${droppedHeight} height, ${droppedBounds} out-of-bounds) out of ${numTrees} extracted.`
+        );
+      }
+      if (CONFIG.DEBUG_LOGS) {
+        console.log(
+          `[RealTrees] ✅ Tile ${tileEntry.id}: ${kept} trees kept (${usedCells.size} grid cells, ` +
+          `${terrainHeightCache.size} terrain queries)`
+        );
+      }
     } catch (e) {
       console.error(`[RealTrees] ❌ Error processing tile ${tileEntry.id}:`, e);
       state.processedTileIds.add(tileEntry.id);
@@ -261,7 +354,6 @@
 
   // ============================================================
   // Periodic scan: process new tiles, clean up unloaded ones
-  // (and their trace in the spatial grid, v1.3.0)
   // ============================================================
   function scanTiles() {
     const provider = window.geofs?.trees?.simple3DTileProvider;
@@ -282,10 +374,6 @@
         state.processedTileIds.delete(id);
         state.flatCacheDirty = true;
 
-        // FIX v1.3.0: remove from the grid only what this tile put in,
-        // without having to scan the whole grid to find who owns what.
-        // If a cell ends up with no tiles left after this, delete the
-        // cell too so we don't accumulate empty Maps.
         const cells = state.tileCellKeys.get(id);
         if (cells) {
           for (const key of cells) {
@@ -325,30 +413,25 @@
     return combined;
   }
 
-  // FIX v1.3.0: rewritten to use the spatial grid instead of scanning
-  // ALL trees currently loaded in memory. Before, this was O(total trees
-  // across every tile near you), and since the crash script calls it
-  // every 200ms while flying low over dense forest, that felt like lag.
-  // Now it's O(trees in the few cells that actually fall within the
-  // requested radius) -- basically a "trail" around the queried
-  // position, not the whole loaded map.
-  //
-  // Also, Cesium.Cartesian3.fromDegrees() is no longer recomputed for
-  // every candidate tree: the grid stores positions already in ECEF
-  // (x,y,z), computed once when the tile was processed. Here it's just
-  // a subtraction and a distance check, no trigonometry per tree.
-  function isTreeNear(lat, lon, radiusMeters) {
+  // FIX v1.9.0: 3D CYLINDER COLLISION MODEL
+  // Replaces the point-sphere distance test. A tree is a vertical cylinder
+  // extending from base (ground level - margin) to canopy height.
+  // We project the delta vector between the tree base and the aircraft along
+  // the local geodetic up-vector (ellipsoid surface normal).
+  function isTreeNear(lat, lon, radiusMeters, heightMeters, canopyHeightMeters) {
     const Cesium = getCesium();
     if (!Cesium) return false;
-    if (state.grid.size === 0) return false; // nothing indexed yet
+    if (state.grid.size === 0) return false;
 
-    // Approximate meters -> degrees conversion (equirectangular, with a
-    // generous margin since this is only used to decide which cells to
-    // look at; the real, exact distance is computed afterward with
-    // Cesium.Cartesian3).
+    const targetHeight = (typeof heightMeters === "number" && Number.isFinite(heightMeters)) ? heightMeters : 0;
+    const canopyH = (typeof canopyHeightMeters === "number" && Number.isFinite(canopyHeightMeters) && canopyHeightMeters > 0)
+      ? canopyHeightMeters
+      : CONFIG.DEFAULT_CANOPY_HEIGHT_M;
+    const baseMargin = CONFIG.BASE_VERTICAL_MARGIN_M;
+
     const metersPerDegLat = 111320;
     const dLatDeg = radiusMeters / metersPerDegLat;
-    const cosLat = Math.max(0.1, Math.cos(Cesium.Math.toRadians(lat))); // avoids division by ~0 near the poles
+    const cosLat = Math.max(0.1, Math.cos(Cesium.Math.toRadians(lat)));
     const dLonDeg = radiusMeters / (metersPerDegLat * cosLat);
 
     const cellDeg = CONFIG.GRID_CELL_DEG;
@@ -357,8 +440,18 @@
     const minGy = Math.floor((lon - dLonDeg) / cellDeg);
     const maxGy = Math.floor((lon + dLonDeg) / cellDeg);
 
-    const target = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
-    const p = new Cesium.Cartesian3();
+    if (!_scratchTarget && Cesium.Cartesian3) {
+      _scratchTarget = new Cesium.Cartesian3();
+      _scratchUpNormal = new Cesium.Cartesian3();
+    }
+    const target = _scratchTarget
+      ? Cesium.Cartesian3.fromDegrees(lon, lat, targetHeight, Cesium.Ellipsoid.WGS84, _scratchTarget)
+      : Cesium.Cartesian3.fromDegrees(lon, lat, targetHeight);
+    // Local vertical unit vector at aircraft location (pointing towards zenith)
+    const upNormal = _scratchUpNormal
+      ? Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(target, _scratchUpNormal)
+      : Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(target, new Cesium.Cartesian3());
+    const radiusSq = radiusMeters * radiusMeters;
 
     for (let gx = minGx; gx <= maxGx; gx++) {
       for (let gy = minGy; gy <= maxGy; gy++) {
@@ -366,10 +459,27 @@
         if (!tileMap) continue;
         for (const arr of tileMap.values()) {
           for (let i = 0; i < arr.length; i += 3) {
-            p.x = arr[i];
-            p.y = arr[i + 1];
-            p.z = arr[i + 2];
-            if (Cesium.Cartesian3.distance(target, p) <= radiusMeters) return true;
+            const px = arr[i];
+            const py = arr[i + 1];
+            const pz = arr[i + 2];
+
+            const dx = target.x - px;
+            const dy = target.y - py;
+            const dz = target.z - pz;
+
+            // Full 3D distance squared
+            const distSq3D = dx * dx + dy * dy + dz * dz;
+
+            // Dot product with local up normal: relative altitude above tree base in meters
+            const hRel = dx * upNormal.x + dy * upNormal.y + dz * upNormal.z;
+
+            // Horizontal distance squared (Pythagorean deduction)
+            const distSqHoriz = Math.max(0, distSq3D - (hRel * hRel));
+
+            // Collision condition: horizontal radius hit AND within tree vertical span
+            if (distSqHoriz <= radiusSq && hRel >= -baseMargin && hRel <= canopyH) {
+              return true;
+            }
           }
         }
       }
@@ -377,9 +487,87 @@
     return false;
   }
 
+  // FIX v1.9.0: Diagnostics support cylinder breakdown (horizontal distance vs relative height)
+  function findNearestTree(lat, lon, radiusMeters, heightMeters, canopyHeightMeters) {
+    const Cesium = getCesium();
+    if (!Cesium) return null;
+    if (state.grid.size === 0) return null;
+
+    const targetHeight = (typeof heightMeters === "number" && Number.isFinite(heightMeters)) ? heightMeters : 0;
+    const canopyH = (typeof canopyHeightMeters === "number" && Number.isFinite(canopyHeightMeters) && canopyHeightMeters > 0)
+      ? canopyHeightMeters
+      : CONFIG.DEFAULT_CANOPY_HEIGHT_M;
+    const baseMargin = CONFIG.BASE_VERTICAL_MARGIN_M;
+
+    const metersPerDegLat = 111320;
+    const dLatDeg = radiusMeters / metersPerDegLat;
+    const cosLat = Math.max(0.1, Math.cos(Cesium.Math.toRadians(lat)));
+    const dLonDeg = radiusMeters / (metersPerDegLat * cosLat);
+
+    const cellDeg = CONFIG.GRID_CELL_DEG;
+    const minGx = Math.floor((lat - dLatDeg) / cellDeg);
+    const maxGx = Math.floor((lat + dLatDeg) / cellDeg);
+    const minGy = Math.floor((lon - dLonDeg) / cellDeg);
+    const maxGy = Math.floor((lon + dLonDeg) / cellDeg);
+
+    const target = Cesium.Cartesian3.fromDegrees(lon, lat, targetHeight);
+    const upNormal = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(target, new Cesium.Cartesian3());
+    const radiusSq = radiusMeters * radiusMeters;
+
+    let best = null;
+    let bestDistHoriz = Infinity;
+
+    for (let gx = minGx; gx <= maxGx; gx++) {
+      for (let gy = minGy; gy <= maxGy; gy++) {
+        const tileMap = state.grid.get(gx + "_" + gy);
+        if (!tileMap) continue;
+        for (const [tileId, arr] of tileMap) {
+          for (let i = 0; i < arr.length; i += 3) {
+            const px = arr[i];
+            const py = arr[i + 1];
+            const pz = arr[i + 2];
+
+            const dx = target.x - px;
+            const dy = target.y - py;
+            const dz = target.z - pz;
+
+            const distSq3D = dx * dx + dy * dy + dz * dz;
+            const hRel = dx * upNormal.x + dy * upNormal.y + dz * upNormal.z;
+            const distSqHoriz = Math.max(0, distSq3D - (hRel * hRel));
+
+            if (distSqHoriz <= radiusSq && hRel >= -baseMargin && hRel <= canopyH) {
+              const horizDist = Math.sqrt(distSqHoriz);
+              if (horizDist < bestDistHoriz) {
+                bestDistHoriz = horizDist;
+                const p = new Cesium.Cartesian3(px, py, pz);
+                const carto = Cesium.Cartographic.fromCartesian(p);
+                best = {
+                  tileId,
+                  distance: Math.sqrt(distSq3D),
+                  horizDistance: horizDist,
+                  relHeight: hRel,
+                  lat: Cesium.Math.toDegrees(carto.latitude),
+                  lon: Cesium.Math.toDegrees(carto.longitude),
+                  height: carto.height,
+                  canopyHeight: canopyH
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+    return best;
+  }
+
   window.geofsRealTrees = {
     getAllTrees,
     isTreeNear,
+    findNearestTree,
+    setDebug: (enabled) => {
+      CONFIG.DEBUG_LOGS = !!enabled;
+      console.log(`[RealTrees] Debug logs: ${CONFIG.DEBUG_LOGS ? "ON (verbose)" : "OFF (quiet)"}`);
+    },
     _state: state
   };
 
@@ -392,7 +580,11 @@
       clearInterval(poller);
       setInterval(scanTiles, CONFIG.RESCAN_INTERVAL_MS);
       scanTiles();
-      console.log("[RealTrees] 🌳 Extractor initialized (v1.3.0, with spatial grid for fast isTreeNear). Use window.geofsRealTrees from the console or other scripts.");
+      console.log(
+        "%c[RealTrees]%c 🌳 Extractor v1.9.2 ready · Cylinder 3D active · Press [ for Dashboard",
+        "color:#10b981;font-weight:bold;",
+        "color:#94a3b8;"
+      );
     } else if (++attempts > 200) {
       clearInterval(poller);
       console.error("[RealTrees] ❌ geofs.trees.simple3DTileProvider never appeared");
@@ -400,9 +592,7 @@
   }, 300);
 
   // ============================================================
-  // DASHBOARD (added -- purely additive, doesn't touch anything
-  // above). Opens/closes with the [ key and shows live stats read
-  // directly from the existing `state` and from getAllTrees().
+  // DASHBOARD ([ key)
   // ============================================================
   let dashPanel = null;
   let dashUpdateInterval = null;
@@ -420,7 +610,14 @@
         border: 1px solid rgba(120,255,150,0.25);
         font-family: 'Segoe UI', sans-serif; color: #fff;
       }
-      #rt-dash .rt-title { font-weight: bold; font-size: 15px; margin-bottom: 12px; text-align: center; }
+      #rt-dash .rt-title { font-weight: bold; font-size: 15px; margin-bottom: 0; text-align: left; }
+      #rt-dash .rt-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 8px; }
+      #rt-dash .rt-close-x {
+        width: 24px; height: 24px; line-height: 22px; text-align: center;
+        background: rgba(255,255,255,0.12); border: 1px solid rgba(120,255,150,0.3);
+        border-radius: 6px; color: #fff; font-size: 14px; cursor: pointer; font-weight: bold;
+      }
+      #rt-dash .rt-close-x:hover { background: rgba(120,255,150,0.25); }
       #rt-dash .rt-row {
         display: flex; justify-content: space-between; padding: 5px 0;
         border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 12.5px;
@@ -428,7 +625,13 @@
       #rt-dash .rt-row:last-child { border-bottom: none; }
       #rt-dash .rt-label { color: #9fdcaa; }
       #rt-dash .rt-val { color: #e8ffe8; font-family: monospace; font-weight: 600; }
-      #rt-dash .rt-hint { text-align: center; font-size: 10px; color: #6a8a70; margin-top: 10px; }
+      #rt-dash .rt-close-btn {
+        width: 100%; margin-top: 12px; padding: 6px 0;
+        background: rgba(20,50,25,0.85); border: 1px solid rgba(120,255,150,0.35);
+        border-radius: 6px; color: #a5f3b6; font-size: 11.5px; cursor: pointer; font-weight: 600;
+      }
+      #rt-dash .rt-close-btn:hover { background: rgba(30,70,35,0.95); }
+      #rt-dash .rt-hint { text-align: center; font-size: 10px; color: #6a8a70; margin-top: 8px; }
     `;
     document.head.appendChild(style);
   }
@@ -440,13 +643,6 @@
   function renderDashStats() {
     if (!dashPanel) return;
 
-    // FIX: this used to read getAllTrees().length, which still carries
-    // the old MAX_TREES_KEPT cap (200,000) meant only for that debug
-    // helper. The actual detection path (isTreeNear) uses the spatial
-    // grid, which has no cap at all -- so showing the capped number
-    // here gave the false impression that trees were being dropped.
-    // We now sum directly from treesByTile, uncapped, to show what's
-    // really indexed.
     let totalTrees = 0;
     for (const arr of state.treesByTile.values()) totalTrees += arr.length / 3;
 
@@ -460,14 +656,20 @@
     dashPanel.querySelector("#rt-decoder").textContent = decoderStatus;
   }
 
-  function showDashboard() {
+  function closeDashboard() {
     if (dashPanel) {
       dashPanel.remove();
       dashPanel = null;
-      if (dashUpdateInterval) {
-        clearInterval(dashUpdateInterval);
-        dashUpdateInterval = null;
-      }
+    }
+    if (dashUpdateInterval) {
+      clearInterval(dashUpdateInterval);
+      dashUpdateInterval = null;
+    }
+  }
+
+  function showDashboard() {
+    if (dashPanel) {
+      closeDashboard();
       return;
     }
 
@@ -476,14 +678,21 @@
     dashPanel = document.createElement("div");
     dashPanel.id = "rt-dash";
     dashPanel.innerHTML = `
-      <div class="rt-title">🌳 Real Tree Positions -- Dashboard</div>
+      <div class="rt-header">
+        <div class="rt-title">🌳 Real Tree Positions -- Dashboard v1.9.2</div>
+        <button class="rt-close-x" id="rt-close-x" title="Cerrar dashboard ([ o clic)">✕</button>
+      </div>
       <div class="rt-row"><span class="rt-label">Indexed trees</span><span class="rt-val" id="rt-trees">-</span></div>
       <div class="rt-row"><span class="rt-label">Processed tiles</span><span class="rt-val" id="rt-tiles">-</span></div>
       <div class="rt-row"><span class="rt-label">Active grid cells</span><span class="rt-val" id="rt-cells">-</span></div>
       <div class="rt-row"><span class="rt-label">Draco decoder</span><span class="rt-val" id="rt-decoder">-</span></div>
-      <div class="rt-hint">Press [ to close</div>
+      <button class="rt-close-btn" id="rt-close-bottom">✕ Cerrar Dashboard (o tecla [)</button>
+      <div class="rt-hint">Tip: Haz clic en ✕ o presiona [</div>
     `;
     document.body.appendChild(dashPanel);
+
+    dashPanel.querySelector("#rt-close-x").onclick = closeDashboard;
+    dashPanel.querySelector("#rt-close-bottom").onclick = closeDashboard;
 
     renderDashStats();
     dashUpdateInterval = setInterval(renderDashStats, 1000);
